@@ -252,12 +252,22 @@ Before=multi-user.target
 Type=oneshot
 ExecStart=/usr/local/bin/phantomixos-skill-loader
 RemainAfterExit=yes
+# No USB stick means no skills, which is a normal state. Never let this unit
+# block the boot.
+SuccessExitStatus=0 1 2
 
 [Install]
 WantedBy=multi-user.target
 EOF
 sudo ln -sf /etc/systemd/system/phantomixos-skills.service \
     "$ROOTFS/etc/systemd/system/multi-user.target.wants/phantomixos-skills.service"
+
+# Hostname. debootstrap inherits whatever the build host is called, so without
+# this the live environment announces itself as the builder's machine.
+echo "phantomixos" | sudo tee "$ROOTFS/etc/hostname" >/dev/null
+if ! grep -q '^127\.0\.1\.1' "$ROOTFS/etc/hosts"; then
+    sudo sed -i '/^127\.0\.0\.1/a 127.0.1.1\tphantomixos' "$ROOTFS/etc/hosts"
+fi
 
 # ---- Cleanup: reclaim disk ----
 # The chroot ships with several hundred MB of reclaimable bulk. Everything
