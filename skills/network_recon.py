@@ -1,5 +1,5 @@
 """
-Network reconnaissance skills for HackinAgent.
+Network reconnaissance skills for PhantomixAgent.
 Loaded at runtime from /skills/ and registered as agent tools.
 """
 

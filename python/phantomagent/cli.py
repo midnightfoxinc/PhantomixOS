@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CLI entry point for HackinAgent.
+CLI entry point for PhantomixAgent.
 Usage:
   phantomagent --target <host> --scope <network|local>
   phantomagent --skills-list
@@ -109,7 +109,7 @@ def cmd_list_skills(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="HackinAgent - AI-powered penetration testing framework",
+        description="PhantomixAgent - AI-powered penetration testing framework",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

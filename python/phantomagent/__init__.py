@@ -1,5 +1,5 @@
 """
-HackinAgent - Multi-agent penetration testing orchestration framework.
+PhantomixAgent - Multi-agent penetration testing orchestration framework.
 Fully offline, runs on llama.cpp (GGUF) inference server.
 Runs at /usr/local/bin/phantom-agent inside the ISO.
 """
