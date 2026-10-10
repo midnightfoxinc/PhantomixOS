@@ -1,0 +1,80 @@
+#!/bin/sh
+# /boot/linuxrc — PhantomixOS initramfs entry point
+# Executed by the kernel after the cpio initramfs is mounted.
+# Boot chain:
+#   1. Scan for PhantomixOS USB media (FAT32, label PHANTOMIX / "AI Dev ISO")
+#   2. Mount USB FAT32 read-only
+#   3. Setup persistence overlay (lower=/live, upper=/persist)
+#   4. Load /skills dynamic tools
+#   5. Mount /results, /ai-models
+#   6. Launch systemd/sysvinit (real root)
+
+set -e
+
+echo "[PHANTOMIXOS] Initramfs entry point starting..."
+echo "[PHANTOMIXOS] Kernel: $(uname -r)"
+
+# 1. Scan for PhantomixOS USB media
+echo "[PHANTOMIXOS] Scanning for PhantomixOS USB media..."
+USBDEV=""
+LABEL=$(blkid -s LABEL -o value /dev/sda 2>/dev/null)
+case "$LABEL" in
+    PHANTOMIX|PHANTOMIXOS|AI\ Dev\ ISO)
+        USBDEV="/dev/sda"
+        echo "[PHANTOMIXOS] Internal scan detected: $USBDEV (label=$LABEL)"
+        ;;
+esac
+
+# 2. Mount USB FAT32 read-only
+if [ -n "$USBDEV" ]; then
+    mkdir -p /mnt/usb
+    if mount -o ro "$USBDEV" /mnt/usb; then
+        echo "[PHANTOMIXOS] USB FAT32 mounted at /mnt/usb (from $USBDEV)"
+    else
+        echo "[PHANTOMIXOS] WARNING: Could not mount $USBDEV, continuing without USB"
+        USBDEV=""
+    fi
+fi
+
+# 3. Persistence overlay (if ext4 partition present)
+if [ -n "$USBDEV" ] && [ -d /mnt/usb/persist ]; then
+    echo "[PHANTOMIXOS] Persistence overlay detected"
+    # Overlay setup via initramfs postmount hook 99-phantomixos-postmount
+else
+    echo "[PHANTOMIXOS] No persistence overlay; /persist = tmpfs (RAM-only)"
+    mkdir -p /persist
+    mount -t tmpfs tmpfs /persist
+fi
+
+# 4. Load /skills dynamic tools
+if [ -d /mnt/usb/skills ]; then
+    echo "[PHANTOMIXOS] Loading /skills tools"
+    for tool in /mnt/usb/skills/*; do
+        [ -f "$tool" ] || continue
+        [ -x "$tool" ] || continue
+        base=$(basename "$tool")
+        ln -sf "$tool" /usr/local/bin/ 2>/dev/null || true
+    done
+    export PYTHONPATH="/mnt/usb/skills:$PYTHONPATH"
+fi
+
+# 5. Mount /results & /ai-models
+mkdir -p /results
+if [ -n "$USBDEV" ] && [ -d /mnt/usb/results ]; then
+    mount --bind /mnt/usb/results /results
+    echo "[PHANTOMIXOS] /results bound from $USBDEV"
+fi
+
+mkdir -p /ai-models
+if [ -n "$USBDEV" ] && [ -d /mnt/usb/ai-models ]; then
+    mount --bind /mnt/usb/ai-models /ai-models
+    echo "[PHANTOMIXOS] /ai-models bound from $USBDEV"
+fi
+
+# Fallback dirs if nothing on USB
+mkdir -p /persist /results /ai-models /skills 2>/dev/null || true
+
+# 6. Launch real init
+echo "[PHANTOMIXOS] Initramfs complete. Launching real init..."
+ls -la /sbin/init 2>/dev/null || ls -la /usr/bin/init 2>/dev/null || true
+exec /sbin/init

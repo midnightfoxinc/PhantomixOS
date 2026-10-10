@@ -1,0 +1,67 @@
+#!/bin/sh
+# /usr/local/bin/phantomixos-overlay-setup
+#
+# Reports how the running system's writable root was constructed.
+#
+# HISTORY -- this script used to mount a second overlay whose upperdir lived on
+# /persist. That was never wired into the boot path, and it could not have
+# worked as written: overlayfs requires an upperdir with xattr support, and
+# /persist is a vfat partition, which has none. It also pivot_root'd into /run,
+# which would have destroyed the live session.
+#
+# The real overlay is now built by initramfs/init, before switch_root:
+#
+#   lowerdir = /newroot   the read-only squashfs
+#   upperdir = /upper     tmpfs (RAM)  -- only *changes* live here
+#   workdir  = /work      tmpfs
+#
+# Changes to the root filesystem are intentionally NOT persistent: they are
+# discarded on reboot. This is standard live-ISO behaviour and is what keeps
+# the RAM footprint bounded. Persistence is provided per-directory instead, by
+# bind-mounting /skills, /results, /ai-models and /persist off the USB stick.
+#
+# Nothing here is required for boot -- this is a diagnostic helper only.
+
+log() { echo "[PHANTOMIXOS-OVERLAY] $*"; }
+
+findmnt_target() {
+    findmnt -n -o FSTYPE,SOURCE --target "$1" 2>/dev/null | head -1
+}
+
+log "=== PhantomixOS storage layout ==="
+
+log ""
+log "Root filesystem:"
+root_info=$(findmnt_target /)
+if [ -n "$root_info" ]; then
+    log "  fstype: $(echo "$root_info" | awk '{print $1}')"
+    log "  source: $(echo "$root_info" | cut -d' ' -f2-)"
+    case "$root_info" in
+        overlay*) log "  -> overlay over the squashfs; changes are RAM-only and vanish on reboot" ;;
+        squashfs*) log "  -> read-only squashfs (overlay unavailable); the session is degraded" ;;
+    esac
+else
+    log "  (findmnt unavailable; skipping)"
+fi
+
+log ""
+log "Persistent directories (bind-mounted from the USB when present):"
+for d in /skills /results /ai-models /persist; do
+    if mountpoint -q "$d" 2>/dev/null; then
+        info=$(findmnt_target "$d")
+        log "  $d  <- $(echo "$info" | cut -d' ' -f2-)  [$(echo "$info" | awk '{print $1}')]"
+    else
+        log "  $d  (not mounted; RAM-only fallback)"
+    fi
+done
+
+log ""
+log "Bundled models (bind-mounted from the ISO by the initramfs):"
+if [ -d /opt/phantomixos/models ]; then
+    ls -lh /opt/phantomixos/models/*.gguf 2>/dev/null | awk '{print "  " $5 "  " $9}'
+else
+    log "  (none bundled; the AI will read /ai-models from the USB)"
+fi
+
+log ""
+log "Note: rootfs changes are NOT persistent by design. Put work in /results."

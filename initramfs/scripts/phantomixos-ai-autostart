@@ -1,0 +1,137 @@
+#!/bin/bash
+# /usr/local/bin/phantomixos-ai-autostart
+# Starts the AI inference stack (llama.cpp server + phantomagent)
+# Designed to run once the system is fully booted.
+#
+# Memory strategy for 8GB RAM:
+#   - ONE model resident at a time (~4.5GB)
+#   - Other models remain on disk, loaded on demand
+#   - Context capped at 8192 tokens to bound KV cache
+#   - Uses swap as buffer (model file is mmap'd, pages evicted under pressure)
+
+set -euo pipefail
+
+MODEL_DIR="/usr/local/share/phantomixos/models"
+LLAMA_SERVER="/usr/local/bin/llama-server"
+LOG_DIR="/results/logs"
+PID_FILE="/run/phantomixos/llama.pid"
+PORT="${PHANTOMIXOS_LLM_PORT:-8080}"
+THREADS="${PHANTOMIXOS_LLM_THREADS:-$(nproc)}"
+CONTEXT="${PHANTOMIXOS_LLM_CONTEXT:-8192}"
+
+log() { echo "[AI-START] $(date '+%H:%M:%S') $*"; }
+
+# ---- Memory check ----
+mem_available_mb=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+log "Available RAM: ${mem_available_mb} MB (threads=$THREADS, context=$CONTEXT)"
+
+if [ "$mem_available_mb" -lt 4500 ]; then
+    log "WARNING: Less than 4.5GB available. Model may swap heavily or OOM."
+    log "Consider: close other apps, or use a smaller model."
+fi
+
+# ---- Locate model ----
+# NOTE: qwen2.5-7b-instruct q4_k_m is sharded upstream into
+#   qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf  (3.72 GB)
+#   qwen2.5-7b-instruct-q4_k_m-00002-of-00002.gguf  (0.64 GB)
+# llama.cpp loads shard 1 and resolves shard 2 by naming convention, so we
+# must pass shard 1 -- the bare "...q4_k_m.gguf" name does not exist.
+# Override with PHANTOMIXOS_MODEL=/path/to/file.gguf
+pick_model() {
+    if [ -n "${PHANTOMIXOS_MODEL:-}" ] && [ -f "${PHANTOMIXOS_MODEL}" ]; then
+        echo "$PHANTOMIXOS_MODEL"; return 0
+    fi
+
+    local dir
+    # Search order: ISO-bundled models, then the USB's /ai-models, then the
+    # in-rootfs default. /opt/phantomixos/models is bind-mounted from the boot
+    # media by the initramfs; /ai-models comes off the USB stick.
+    for dir in "$MODEL_DIR" /opt/phantomixos/models /ai-models /models; do
+        [ -d "$dir" ] || continue
+
+        # Preference order: reasoning agent, then coder, then anything usable.
+        # Globs are ordered so *-00001-of-* is preferred over later shards.
+        for pattern in \
+            "qwen2.5-7b-instruct-q4_k_m-00001-of-*.gguf" \
+            "qwen2.5-7b-instruct-q4_k_m.gguf" \
+            "qwen2.5-coder-7b-instruct-q4_k_m.gguf" \
+            "*.gguf"
+        do
+            local found
+            found=$(ls -1 "$dir"/$pattern 2>/dev/null | head -1)
+            # Never hand llama.cpp a trailing shard; it must be the -00001 file
+            case "$found" in
+                *-0000[2-9]-of-*|*-000[1-9][0-9]-of-*) continue ;;
+            esac
+            if [ -n "$found" ] && [ -s "$found" ]; then
+                echo "$found"; return 0
+            fi
+        done
+    done
+    return 1
+}
+
+MODEL=$(pick_model) || {
+    log "ERROR: No GGUF model found in $MODEL_DIR"
+    log "Populate $MODEL_DIR from /ai-models or rebuild ISO with models."
+    exit 1
+}
+log "Selected model: $(basename "$MODEL")"
+
+# ---- Stop any existing server ----
+if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    log "Stopping existing llama-server (PID $(cat "$PID_FILE"))"
+    kill "$(cat "$PID_FILE")" 2>/dev/null || true
+    sleep 2
+fi
+pkill -f llama-server 2>/dev/null || true
+
+# ---- Start llama-server ----
+mkdir -p "$LOG_DIR"
+log "Starting llama-server on port $PORT..."
+log "Command: $LLAMA_SERVER -m $MODEL -c $CONTEXT -t $THREADS -ngl 0 --port $PORT"
+
+# NOTE: we deliberately do NOT pass --mlock.
+# mlock pins the whole model in unswappable RAM, which on an 8 GB box
+# guarantees an OOM kill when OS + tools are also resident. The default
+# behaviour (mmap the GGUF and let the kernel evict clean file-backed pages
+# under pressure) is what keeps the rest of the system responsive.
+ulimit -l 0 2>/dev/null || true
+
+"$LLAMA_SERVER" \
+    --model "$MODEL" \
+    --ctx-size "$CONTEXT" \
+    --threads "$THREADS" \
+    --n-gpu-layers 0 \
+    --host 127.0.0.1 \
+    --port "$PORT" \
+    --parallel 1 \
+    --no-warmup \
+    > "$LOG_DIR/llama-server.log" 2>&1 &
+
+LLAMA_PID=$!
+echo "$LLAMA_PID" > "$PID_FILE"
+log "llama-server started (PID $LLAMA_PID), log: $LOG_DIR/llama-server.log"
+
+# ---- Wait for readiness ----
+log "Waiting for model load (this takes 10-40s)..."
+for i in $(seq 1 60); do
+    if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+        log "Model loaded and ready at http://127.0.0.1:$PORT"
+        log ""
+        log "  Test with:  phantomagent run --target 192.168.1.1 --scope local"
+        log "  Or chat:    curl -s http://127.0.0.1:$PORT/completion -d '{\"prompt\":\"hello\"}'"
+        log ""
+        exit 0
+    fi
+    if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
+        log "ERROR: llama-server died during startup. Check $LOG_DIR/llama-server.log"
+        tail -20 "$LOG_DIR/llama-server.log"
+        exit 1
+    fi
+    sleep 1
+done
+
+log "ERROR: Timeout waiting for model load (60s)"
+log "Check $LOG_DIR/llama-server.log"
+exit 1

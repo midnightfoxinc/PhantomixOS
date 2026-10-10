@@ -1,0 +1,79 @@
+#!/bin/sh
+# initramfs hook — 99-phantomixos-postmount
+# Runs after root is mounted. Activates:
+#   - /persist overlay (if ext4 partition present)
+#   - /skills -> /usr/local/bin (dynamic tool loading)
+#   - /results, /ai-models bind mounts
+#   - Python path for agent framework
+#   - Launches systemd/init normally
+
+set -e
+
+export PHANTOMIXUSBDIR="/run/phantomixos"
+
+# Load detection result if present
+if [ -f "$PHANTOMIXUSBDIR/device" ]; then
+    USBDEV=$(cat "$PHANTOMIXUSBDIR/device")
+    mkdir -p /mnt/usb
+    mount -o ro "$USBDEV" /mnt/usb
+    echo "[PHANTOMIXOS] USB mounted at /mnt/usb (from $USBDEV)"
+else
+    echo "[PHANTOMIXOS] No USB media detected; continuing with internal storage"
+fi
+
+# ---- Overlay filesystem for persistence ----
+if [ -d /mnt/usb/persist ] && mount -t ext4 -o ro "$USBDEV2" /mnt/usb/persist 2>/dev/null; then
+    echo "[PHANTOMIXOS] Persistence overlay detected: $USBDEV2"
+    # Note: upperdir mount happens at boot via /etc/overlayroot.conf style config
+    # or directly by this hook when root is already mounted
+fi
+
+# If root is already mounted, perform pivot overlay
+if [ -d /mnt/usb/persist ] && [ -f "$PHANTOMIXUSBDIR/device2" ]; then
+    USBDEV2=$(cat "$PHANTOMIXUSBDIR/device2")
+    mkdir -p /persist/work /run/phantomixos/merged
+    mount -t ext4 "$USBDEV2" /persist
+    # Setup overlay
+    mount -t overlay overlay \
+        -o lowerdir=/live,upperdir=/persist,workdir=/persist/work \
+        /run/phantomixos/merged-root
+    echo "[PHANTOMIXOS] Persistence overlay active: / -> /run/phantomixos/merged-root"
+fi
+
+# ---- /skills dynamic loader ----
+mkdir -p /usr/local/bin
+if [ -d /mnt/usb/skills ]; then
+    echo "[PHANTOMIXOS] Loading /skills tools from /mnt/usb/skills"
+    for tool in /mnt/usb/skills/*; do
+        [ -f "$tool" ] || continue
+        [ -x "$tool" ] || continue
+        base=$(basename "$tool")
+        ln -sf "$tool" /usr/local/bin/ 2>/dev/null || true
+    done
+    echo "[PHANTOMIXOS] /skills tools loaded"
+fi
+
+# Python skill path
+if [ -d /mnt/usb/skills ]; then
+    export PYTHONPATH="/mnt/usb/skills:$PYTHONPATH"
+fi
+
+# ---- /results & /ai-models bind mounts ----
+mkdir -p /results
+if [ -d /mnt/usb/results ]; then
+    mount --bind /mnt/usb/results /results
+    echo "[PHANTOMIXOS] /results bound from /mnt/usb/results"
+fi
+
+mkdir -p /ai-models
+if [ -d /mnt/usb/ai-models ]; then
+    mount --bind /mnt/usb/ai-models /ai-models
+    echo "[PHANTOMIXOS] /ai-models bound from /mnt/usb/ai-models"
+fi
+
+# Fallback directories if not present on USB
+mkdir -p /persist /results /ai-models /skills 2>/dev/null || true
+
+# Continue with normal init
+echo "[PHANTOMIXOS] All mounts complete. Launching init..."
+exec /sbin/init

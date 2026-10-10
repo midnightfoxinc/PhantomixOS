@@ -1,0 +1,38 @@
+#!/bin/sh
+# initramfs hook — 00-phantomixos-usb-detect
+# Runs during mkinitramfs build and at boot time.
+# Detects PhantomixOS USB media (FAT32, label PHANTOMIX or "AI Dev ISO")
+# Exposes mount path via /run/phantomixos for later hooks.
+
+set -e
+
+# Expose functions for later hooks
+export PHANTOMIXUSBDIR="/run/phantomixos"
+mkdir -p "$PHANTOMIXUSBDIR"
+
+# Scan all block devices for FAT32 partitions
+scan_hackin_iso() {
+    local dev label
+    for dev in $(blkid -t TYPE=vfat -o device 2>/dev/null); do
+        label=$(blkid -s LABEL -o value "$dev" 2>/dev/null)
+        case "$label" in
+            PHANTOMIX|PHANTOMIXOS|AI\ Dev\ ISO)
+                echo "$dev"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+# Export detected device for post-mount hooks
+USBDEV=$(scan_hackin_iso)
+if [ -n "$USBDEV" ]; then
+    echo "$USBDEV" > "$PHANTOMIXUSBDIR/device"
+    echo "[PHANTOMIXOS] USB media detected on $USBDEV"
+else
+    echo "[PHANTOMIXOS] No PhantomixOS USB media found"
+fi
+
+# Exit success - hook completed (media may or may not be present)
+exit 0

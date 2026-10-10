@@ -1,0 +1,33 @@
+# ---- Build artifacts: regenerable by ./scripts/build-iso.sh ----
+build/
+
+# ---- Model weights: too large for git, fetched by ./scripts/download-models.sh ----
+models/
+
+# ---- Third-party reference ISOs, not part of this project ----
+# These are upstream OS images used only as comparison/reference material.
+*.iso
+
+# ---- Rootfs / initramfs staging ----
+rootfs/
+initramfs-stage/
+live/
+iso/
+
+# ---- Python bytecode ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---- Editor / OS cruft ----
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---- Secrets ----
+.env
+*.key
+*.pem

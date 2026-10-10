@@ -1,0 +1,220 @@
+#!/bin/sh
+# /init — PhantomixOS initramfs initramfs (PID 1)
+#
+# Replaces Debian's stock initrd, which cannot boot from a squashfs nested
+# inside an ISO9660 image (there is no root= block device to mount).
+#
+# Boot sequence:
+#   1. mount pseudo-filesystems (/proc /sys /dev)
+#   2. load the modules needed to read the ISO and its squashfs
+#   3. locate the boot media by volume label, then by content signature
+#   4. loop-mount live/filesystem.squashfs
+#   5. switch_root into it and exec /phantomixos-init
+#
+# No overlayfs is used here. See docs/VALIDATION.md: an overlay upperdir
+# cannot live on the USB's FAT32 partition (no xattr support), so persistence
+# is handled by bind-mounting /skills /results /ai-models /persist instead.
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
+
+SQUASH_REL="live/filesystem.squashfs"
+
+# Where the boot media gets mounted while we look for the squashfs
+PROBE=/cdrom
+NEWROOT=/newroot
+
+log() { echo "[INITRAMFS] $*"; }
+
+die() {
+    echo "[INITRAMFS] FATAL: $*"
+    echo "[INITRAMFS] Dropping to emergency shell."
+    exec /bin/sh
+}
+
+# ---- 1. Pseudo-filesystems ----
+mount -t proc     proc     /proc  2>/dev/null
+mount -t sysfs    sysfs    /sys   2>/dev/null
+mount -t devtmpfs devtmpfs /dev   2>/dev/null || {
+    # Fallback if devtmpfs is unavailable: make the console usable at least
+    mkdir -p /dev/pts
+    mount -t devpts devpts /dev/pts 2>/dev/null
+}
+
+log "kernel: $(uname -r)"
+
+# Read the kernel cmdline only AFTER /proc is mounted. It is the only channel
+# that survives switch_root -- there is no environment to inherit -- so the
+# grub menu options (phantomixos.*) are consumed from here.
+CMDLINE=$(cat /proc/cmdline 2>/dev/null)
+log "cmdline: $CMDLINE"
+
+# ---- 2. Modules ----
+# CONFIG_SQUASHFS=m, CONFIG_BLK_DEV_LOOP=m, CONFIG_ISO9660_FS=m,
+# CONFIG_OVERLAY_FS=m in the Debian amd64 kernel, so all of these must be
+# loaded explicitly.
+
+# Modules are insmod'ed from the dependency-ordered list that
+# build-initramfs.sh emitted, rather than via modprobe: Debian's busybox
+# modprobe has no -d flag, so it cannot be pointed at the staged tree and it
+# fails silently (exit 0, nothing loaded). Reading the list ourselves is both
+# deterministic and debuggable -- a module that genuinely fails to load is
+# reported by name.
+KVER=$(uname -r)
+MODROOT="/lib/modules/$KVER"
+LOADED=0
+while read -r mod; do
+    [ -n "$mod" ] || continue
+    case "$mod" in \#*) continue ;; esac
+    if insmod "$MODROOT/$mod" 2>/dev/null; then
+        LOADED=$((LOADED + 1))
+    else
+        # Already built in, or already loaded by an earlier entry -- not fatal.
+        log "  skip $mod (built in, already loaded, or unavailable)"
+    fi
+done < /modules.load
+log "modules loaded: $LOADED"
+
+sleep 1
+
+# ---- 3. Locate the boot media ----
+# Primary: match the ISO volume label set by grub-mkrescue --volid.
+# Fallback: mount each block device read-only and look for the squashfs.
+# This is what lets the same ISO boot from CD, DVD, or a written USB stick.
+find_boot_device() {
+    _dev
+
+    # Give the kernel a moment to enumerate devices.
+    _tries=0
+    while [ "$_tries" -lt 10 ]; do
+        [ -e /dev/sr0 ] && break
+        _tries=$((_tries + 1))
+        sleep 1
+    done
+
+    for _dev in $(ls /dev/sr* /dev/sd* /dev/vd* 2>/dev/null); do
+        _label=$(blkid -s LABEL -o value "$_dev" 2>/dev/null)
+        case "$_label" in
+            PHANTOMIXOS|PHANTOMIX|PHANTOMIX-ISO)
+                log "boot media by label '$_label': $_dev"
+                echo "$_dev"
+                return 0
+                ;;
+        esac
+    done
+
+    log "no label match; probing devices by content..."
+    for _dev in $(ls /dev/sr* /dev/sd* /dev/vd* 2>/dev/null); do
+        mkdir -p "$PROBE"
+        # udf first (what xorriso writes), then iso9660
+        if mount -o ro,noatime "$_dev" "$PROBE" 2>/dev/null || \
+           mount -t udf -o ro,noatime "$_dev" "$PROBE" 2>/dev/null || \
+           mount -t iso9660 -o ro,noatime "$_dev" "$PROBE" 2>/dev/null; then
+            if [ -f "$PROBE/$SQUASH_REL" ]; then
+                log "boot media by content: $_dev"
+                echo "$_dev"
+                return 0
+            fi
+            umount "$PROBE" 2>/dev/null
+        fi
+    done
+
+    return 1
+}
+
+BOOT_DEV=$(find_boot_device) || die "could not find PhantomixOS boot media"
+
+# ---- 4. Loop-mount the squashfs ----
+SQUASH="$PROBE/$SQUASH_REL"
+[ -f "$SQUASH" ] || die "squashfs missing at $SQUASH"
+
+mkdir -p "$NEWROOT"
+if ! mount -t squashfs -o loop,ro "$SQUASH" "$NEWROOT" 2>/dev/null; then
+    # Older kernels want an explicit loop device.
+    loopdev=$(losetup -f 2>/dev/null) || die "no free loop device"
+    losetup "$loopdev" "$SQUASH" || die "losetup failed for $SQUASH"
+    mount -t squashfs -o ro "$loopdev" "$NEWROOT" || die "squashfs mount failed"
+fi
+
+[ -x "$NEWROOT/phantomixos-init" ] || die "$NEWROOT/phantomixos-init is missing from the squashfs"
+log "squashfs mounted at $NEWROOT ($(ls "$NEWROOT" 2>/dev/null | wc -l) top-level entries)"
+
+# ---- 5. Writable root ----
+# The squashfs is read-only, but systemd needs a writable /var (journal,
+# /var/lib state) or a large fraction of units fail. So we overlay the
+# squashfs with a tmpfs upper: lowerdir is the immutable squashfs, and only
+# *changes* land in RAM. That keeps the RAM cost to what actually changes
+# (tens of MB), not to the ~1 GB root, and changes are discarded on reboot --
+# which is the correct live-ISO behaviour.
+#
+# This is also why the root is NOT overlaid onto the USB: overlayfs needs an
+# upperdir with xattr support, and vfat has none. Persistence for /skills,
+# /results, /ai-models and /persist is done by bind-mounting them instead,
+# which is filesystem-agnostic.
+MERGED=/merged
+UPPERDIRS=/overlay
+UPPER=$OVERLAYDIRS/upper
+WORK=$OVERLAYDIRS/work
+
+log "setting up writable overlay root..."
+mkdir -p "$MERGED" "$UPPER" "$WORK"
+
+# 512M is enough for /var, /run and logs in a live session. Overridable from
+# the grub menu via phantomixos.upper.size=.
+UPPER_SIZE=512M
+for arg in $CMDLINE; do
+    case "$arg" in
+        phantomixos.upper.size=*) UPPER_SIZE="${arg#*=}" ;;
+    esac
+done
+
+OVERLAY_OK=0
+# upperdir and workdir MUST live on the same filesystem, so both are created
+# inside a single tmpfs rather than as two separate mounts. Mounting them
+# separately fails with:
+#   overlayfs: workdir and upperdir must reside under the same mount
+if mount -t tmpfs -o "size=$UPPER_SIZE,mode=0755" tmpfs "$OVERLAYDIRS" 2>/dev/null; then
+    if mount -t overlay overlay \
+        -o "lowerdir=$NEWROOT,upperdir=$UPPER,workdir=$WORK" "$MERGED" 2>/dev/null; then
+        OVERLAY_OK=1
+        log "overlay root mounted ($UPPER_SIZE upper)"
+    else
+        log "WARNING: overlay mount failed; falling back to read-only root"
+        umount "$OVERLAYDIRS" 2>/dev/null
+    fi
+fi
+
+if [ "$OVERLAY_OK" -eq 1 ]; then
+    TARGET="$MERGED"
+else
+    TARGET="$NEWROOT"
+fi
+
+# ---- 6. Hand off ----
+# Pseudo-filesystems are mounted *into* the target. With the overlay in place
+# these are mounts over the merged view, so nothing has to be written into the
+# read-only lower.
+mount -t proc     proc     "$TARGET/proc" 2>/dev/null
+mount -t sysfs    sysfs    "$TARGET/sys"  2>/dev/null
+mount -t devtmpfs devtmpfs "$TARGET/dev"  2>/dev/null
+mkdir -p "$TARGET/dev/pts" 2>/dev/null
+mount -t devpts devpts "$TARGET/dev/pts" -o gid=5,mode=620 2>/dev/null
+
+# Models bundled on the ISO live under /live/models. We are about to release
+# the boot media (its 4+ GB should not stay pinned for the whole session), so
+# bind them into the new root first: the bind keeps the underlying block
+# device alive even after the original mountpoint is gone.
+if [ -d "$PROBE/live/models" ] && ls "$PROBE/live/models"/*.gguf >/dev/null 2>&1; then
+    if mkdir -p "$TARGET/opt/phantomixos/models" 2>/dev/null &&
+       mount --bind "$PROBE/live/models" "$TARGET/opt/phantomixos/models" 2>/dev/null; then
+        log "bundled models available at /opt/phantomixos/models"
+    else
+        log "WARNING: could not bind bundled models (root is read-only)"
+    fi
+fi
+
+# Release the boot media: from here on only the bind mount holds it.
+umount "$PROBE" 2>/dev/null
+
+log "switching root -> /phantomixos-init"
+exec switch_root "$TARGET" /phantomixos-init

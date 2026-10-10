@@ -1,0 +1,158 @@
+#!/bin/sh
+# /phantomixos-init — PhantomixOS real-root init script
+# Executed by initramfs after squashfs + overlay are mounted at /
+# Sets up the live environment: mounts USB partitions, loads skills,
+# and hands off to the standard Debian init.
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+echo "[PHANTOMIXOS-INIT] Starting PhantomixOS live environment..."
+
+log() { echo "[PHANTOMIXOS-INIT] $*"; }
+
+# ---- 1. Scan for PhantomixOS USB media ----
+CMDLINE=$(cat /proc/cmdline 2>/dev/null)
+has_opt() {
+    case " $CMDLINE " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+
+log "Scanning block devices for PhantomixOS media (label: PHANTOMIX)..."
+USB_DEV=""
+USB_MOUNT="/mnt/phantomixos-usb"
+
+if has_opt phantomixos.no.usb.detect=1; then
+    log "USB auto-detection disabled on the kernel cmdline"
+else
+    # Both vfat and ext4 are accepted. ext4 is the recommended layout for the
+    # data partition: FAT32 cannot hold a file larger than 4 GiB, and
+    # qwen2.5-coder-7b-instruct-q4_k_m.gguf is 4,683,073,536 bytes -- 388 MB
+    # over the limit -- so on FAT32 that model can never be stored at all.
+    # ext4 also carries xattrs, which is what an overlay upperdir requires.
+    for dev in $(lsblk -n -o NAME,FSTYPE 2>/dev/null | awk '$2=="vfat" || $2=="ext4"{print $1}'); do
+        LABEL=$(blkid -s LABEL -o value "/dev/$dev" 2>/dev/null)
+        case "$LABEL" in
+            PHANTOMIX|PHANTOMIXOS|PHANTOMIX-ISO|"AI Dev ISO")
+                USB_DEV="/dev/$dev"
+                USB_FS=$(lsblk -n -o FSTYPE "/dev/$dev" 2>/dev/null | head -1 | tr -d ' ')
+                log "Found PhantomixOS USB on /dev/$dev (label='$LABEL', fs=$USB_FS)"
+                break
+                ;;
+        esac
+    done
+fi
+
+if [ -z "$USB_DEV" ] && ! has_opt phantomixos.no.usb.detect=1; then
+    # Fallback: any removable FAT or ext4 partition
+    for dev in $(lsblk -n -o NAME,FSTYPE,RM 2>/dev/null \
+                 | awk '($2=="vfat" || $2=="ext4") && $3==1{print $1}'); do
+        USB_DEV="/dev/$dev"
+        USB_FS=$(lsblk -n -o FSTYPE "/dev/$dev" 2>/dev/null | head -1 | tr -d ' ')
+        log "Fallback: using removable device /dev/$dev ($USB_FS)"
+        break
+    done
+fi
+
+if [ -n "$USB_DEV" ]; then
+    mkdir -p "$USB_MOUNT"
+    # Read-WRITE. The data partitions are the only part of the stick we write
+    # to; the ISO itself is read from the optical/loop media, not from here.
+    # Mounting ro and then trying to remount a *bind* rw cannot work (a bind
+    # mount cannot be made rw while its source fs is ro), which used to leave
+    # /skills and /results silently read-only.
+    if mount -o rw,noatime "$USB_DEV" "$USB_MOUNT" 2>/dev/null; then
+        log "USB media mounted at $USB_MOUNT (read-write)"
+
+        # ---- 2. Bind-mount the data dirs ----
+        for dir in skills results ai-models persist; do
+            if [ -d "$USB_MOUNT/$dir" ]; then
+                mkdir -p "/$dir"
+                if mount --bind "$USB_MOUNT/$dir" "/$dir" 2>/dev/null; then
+                    log "/$dir bind-mounted from USB (persistent)"
+                else
+                    log "WARNING: could not bind-mount /$dir -- using tmpfs"
+                    mount -t tmpfs -o size=64M tmpfs "/$dir" 2>/dev/null || \
+                        log "WARNING: /$dir is neither bind-mounted nor tmpfs"
+                fi
+            else
+                # Not present on the stick: back it with RAM rather than
+                # leaving the directory on the read-only overlay lower.
+                mkdir -p "/$dir"
+                if mount -t tmpfs -o size=64M tmpfs "/$dir" 2>/dev/null; then
+                    log "/$dir not on USB -- backed by tmpfs (RAM only)"
+                fi
+            fi
+        done
+
+        # fstab describes the real root (an overlay over squashfs, mounted by
+        # the initramfs) and the data mounts, so systemd does not try to
+        # remount / or invent a device for it.
+        cat > /etc/fstab <<EOF
+# PhantomixOS live fstab
+# Root is an overlay (squashfs lower + tmpfs upper), mounted by the initramfs
+# before switch_root; 'none' keeps systemd from trying to remount it.
+none         /               overlay  defaults        0 0
+$USB_DEV       /phantomixos-usb  ${USB_FS:-vfat}  rw,noatime   0 0
+EOF
+    else
+        log "WARNING: could not mount $USB_DEV -- running RAM-only"
+        mkdir -p /skills /results /ai-models /persist
+        for dir in skills results ai-models persist; do
+            mount -t tmpfs -o size=64M tmpfs "/$dir" 2>/dev/null
+        done
+    fi
+else
+    log "No PhantomixOS USB media found - running in RAM-only mode"
+    mkdir -p /skills /results /ai-models /persist
+    for dir in skills results ai-models persist; do
+        mount -t tmpfs -o size=64M tmpfs "/$dir" 2>/dev/null
+    done
+fi
+
+# ---- 3. Mount tmpfs for /run and /tmp (keeps squashfs clean) ----
+mountpoint -q /run || mount -t tmpfs tmpfs /run
+mountpoint -q /tmp || mount -t tmpfs tmpfs /tmp
+
+# ---- 4. Set up /etc/mtab ----
+grep -q "/etc/mtab" /etc/fstab 2>/dev/null || \
+    echo "none /proc proc defaults 0 0" >> /etc/fstab
+ln -sf /proc/self/mounts /etc/mtab 2>/dev/null || true
+
+# ---- 5. Ensure hardware interfaces are up ----
+# (udev/systemd handles this in real root; safe to skip here)
+
+# ---- 6. Create live user ----
+# Passwordless sudo for the live user
+if ! id hackin >/dev/null 2>&1; then
+    log "Creating live user 'hackin'"
+    useradd -m -s /bin/bash -G sudo,audio,video,plugdev,netdev,cdrom,floppy,dialout hackin 2>/dev/null || \
+    useradd -m -s /bin/bash hackin
+    echo "hackin ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/hackin
+    chmod 0440 /etc/sudoers.d/hackin
+fi
+
+# Set root password too (empty = passwordless for live)
+passwd -d root 2>/dev/null || true
+
+# ---- 7. Activate the AI stack ----
+if [ -x /usr/local/bin/phantomixos-ai-autostart ]; then
+    log "AI autostart script available (run manually after login)"
+fi
+
+# ---- 8. Banner ----
+cat <<EOF
+
+  ╔══════════════════════════════════════════════════════════╗
+  ║  PhantomixOS 0.1.0 - AI-Powered Penetration Testing       ║
+  ║  Fully Offline | FOSS | Libre Firmware Only              ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║  Login: hackin (no password)                             ║
+  ║  Start AI:  phantomixos-ai-autostart                      ║
+  ║  Run Test:  phantomagent run --target <TARGET>           ║
+  ║  Results:   /results/    Skills: /skills/               ║
+  ╚══════════════════════════════════════════════════════════╝
+
+EOF
+
+# ---- 9. Hand off to standard init ----
+log "Handing off to /sbin/init..."
+exec /sbin/init

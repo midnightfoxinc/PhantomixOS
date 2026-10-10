@@ -1,0 +1,100 @@
+#!/bin/sh
+# /usr/local/bin/phantomixos-skill-loader
+# Dynamic /skills loader (shell for initramfs portability)
+# Runs after root mount to populate /usr/local/bin and PYTHONPATH
+# Designed to be lightweight (no Python dep for the loader itself)
+
+set -e
+
+SKILLS_DIR="/skills"
+TARGET_BIN="/usr/local/bin"
+
+log() {
+    echo "[PHANTOMIXOS-SKILLS] $*"
+}
+
+# 1. Load external skill binaries dynamically
+load_binaries() {
+    local src="$1"
+    local dst="$2"
+
+    if [ -z "$src" ] || [ ! -d "$src" ]; then
+        return 0
+    fi
+
+    log "Scanning $src for executables..."
+    find "$src" -maxdepth 2 -type f -executable | while IFS= read -r tool; do
+        base=$(basename "$tool")
+        target="$dst/$base"
+        if [ ! -e "$target" ]; then
+            ln -sf "$tool" "$target"
+            log "Loaded skill: $base -> $target"
+        fi
+    done
+}
+
+# 2. Add Python skill paths to environment
+setup_python_path() {
+    if [ -d "$SKILLS_DIR" ]; then
+        if [ -n "$PYTHONPATH" ]; then
+            export PYTHONPATH="$SKILLS_DIR:$PYTHONPATH"
+        else
+            export PYTHONPATH="$SKILLS_DIR"
+        fi
+        log "PYTHONPATH updated: $PYTHONPATH"
+    fi
+}
+
+# 3. Load Python skills metadata (optional index)
+load_skill_index() {
+    local src="$1"
+    if [ -f "$src/.index.json" ]; then
+        log "Skill index found:"
+        # jq is optional -- fall back to dumping the raw JSON.
+        if command -v jq >/dev/null 2>&1; then
+            jq -r '.skills[]? | "\(.name): \(.description)"' "$src/.index.json" 2>/dev/null || cat "$src/.index.json"
+        else
+            cat "$src/.index.json"
+        fi
+    fi
+}
+
+# 4. Verify loaded tools are available
+verify_tools() {
+    local count=0
+    count=$(find "$TARGET_BIN" -maxdepth 1 -type f 2>/dev/null | wc -l)
+    log "Verified $count binaries in $TARGET_BIN"
+}
+
+# ---- Main Execution ----
+main() {
+    # Check primary skills locations
+    for src in "$SKILLS_DIR" "/mnt/usb/skills"; do
+        if [ -d "$src" ]; then
+            load_binaries "$src" "$TARGET_BIN"
+            load_skill_index "$src"
+        fi
+    done
+
+    setup_python_path
+    verify_tools
+
+    log "Skill loading complete."
+    log "Available skills:"
+    # Every path below must end successfully: this runs as a systemd oneshot
+    # under `set -e`, so a non-zero exit here marks the unit FAILED even though
+    # an empty /skills is a perfectly normal state (no USB stick attached).
+    # `ls` on an empty directory exits 1, which is exactly what used to happen.
+    if [ -x "$TARGET_BIN/phantomagent" ]; then
+        "$TARGET_BIN/phantomagent" skills --skills-dir "$SKILLS_DIR" 2>/dev/null || true
+    fi
+    if [ -n "$(ls -A "$SKILLS_DIR" 2>/dev/null)" ]; then
+        ls -1 "$SKILLS_DIR" 2>/dev/null || true
+    else
+        log "  (none - $SKILLS_DIR is empty; copy skills onto the USB stick)"
+    fi
+
+    return 0
+}
+
+main "$@"
