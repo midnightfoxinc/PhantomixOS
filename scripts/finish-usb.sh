@@ -21,6 +21,12 @@ MODELSET="${2:-qwen-instruct}"
 ISO="$ROOT/build/output/PhantomixOS-0.1.0-amd64.iso"
 LOG=/tmp/px-boot.log
 
+# Dedicated mountpoint. NOT /mnt: this repo lives under /mnt/storage, so mounting
+# over /mnt would shadow the mountpoint parent and make the script's own working
+# directory vanish mid-run -- which is exactly how the first attempt died with
+# empty /mnt/ai-models and a 0-byte boot log.
+MNT=/mnt/phantomixos-usb
+
 log() { echo "[finish-usb] $*"; }
 die() { echo "[finish-usb] ERROR: $*" >&2; exit 1; }
 
@@ -78,36 +84,38 @@ esac
 for m in "${MODELS[@]}"; do
     [ -f "$ROOT/models/$m" ] || die "missing model: $ROOT/models/$m"
 done
-NEED=$(du -ch "$ROOT"/models/ "${MODELS[@]/#/$ROOT/models/}" 2>/dev/null | tail -1 | cut -f1 || echo 0)
 
-if mountpoint -q /mnt; then umount /mnt; fi
-mkdir -p /mnt
-mount "$P2" /mnt
-mkdir -p /mnt/skills /mnt/results /mnt/ai-models /mnt/persist
+# Size ONLY the selected files. Counting the models/ directory as well would
+# add the unselected weights and reject every model set as too large.
+NEED_KB=$(du -ck "${MODELS[@]/#/$ROOT/models/}" | tail -1 | cut -f1)
 
-AVAIL_KB=$(df --output=avail -k /mnt | tail -1 | tr -d ' ')
-NEED_KB=$(du -ck "$ROOT"/models/ "${MODELS[@]/#/$ROOT/models/}" 2>/dev/null | tail -1 | cut -f1)
-log "  need $(( NEED_KB / 1024 )) MiB, have $(( AVAIL_KB / 1024 )) MiB"
+mountpoint -q "$MNT" && umount "$MNT"
+mkdir -p "$MNT"
+mount "$P2" "$MNT"
+mkdir -p "$MNT"/skills "$MNT"/results "$MNT"/ai-models "$MNT"/persist
+
+AVAIL_KB=$(df --output=avail -k "$MNT" | tail -1 | tr -d ' ')
+log "  set '$MODELSET': need $(( NEED_KB / 1024 )) MiB, have $(( AVAIL_KB / 1024 )) MiB"
 if [ "$NEED_KB" -gt "$AVAIL_KB" ]; then
-    umount /mnt
-    die "not enough space on $P2 for model set '$MODELSET' (need $((NEED_KB/1024)) MiB, have $((AVAIL_KB/1024)) MiB). Try a different MODELSET."
+    umount "$MNT"
+    die "not enough space on $P2 for '$MODELSET' (need $((NEED_KB/1024)) MiB, have $((AVAIL_KB/1024)) MiB). Try a different MODELSET."
 fi
 
 # rsync if available (resumable across the 4 GiB+ files), else cp
 if command -v rsync >/dev/null 2>&1; then
     for m in "${MODELS[@]}"; do
-        rsync -ah --info=progress2 --partial "$ROOT/models/$m" /mnt/ai-models/
+        rsync -ah --info=progress2 --partial "$ROOT/models/$m" "$MNT/ai-models/"
     done
 else
     for m in "${MODELS[@]}"; do
-        cp "$ROOT/models/$m" /mnt/ai-models/
+        cp "$ROOT/models/$m" "$MNT/ai-models/"
     done
 fi
 sync
 log "Models on stick:"
-ls -lh /mnt/ai-models/
-df -h /mnt | tail -1
-umount /mnt
+ls -lh "$MNT/ai-models/"
+df -h "$MNT" | tail -1
+umount "$MNT"
 
 log ""
 log "=== Final blkid ==="
